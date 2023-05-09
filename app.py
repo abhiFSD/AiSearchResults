@@ -1,16 +1,25 @@
-from nltk.tokenize import word_tokenize
 import os
 import json
 import openai
 import requests
 from flask import Flask, request, jsonify, render_template, session
 from googleapiclient.discovery import build
+import aiohttp
+from aiohttp import ClientSession
+from aiohttp import ClientConnectorError
+from google.auth import exceptions
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 import spacy.cli
 import spacy
 import uuid
 from flask_socketio import SocketIO, emit
 import threading
+import asyncio
+import async_timeout
+from openai.error import OpenAIError, RateLimitError
 
 app = Flask(__name__)
 
@@ -50,22 +59,33 @@ def calculate_total_tokens(text):
     return len(tokens)
 
 
-def search(query, num_results):
-    service = build("customsearch", "v1", developerKey=API_KEY)
+async def search(query, num_results):
     results = []
     start = 1
-
     session_id = uuid.uuid4().hex
     search_status[session_id] = "searching"
 
-    while len(results) < num_results:
-        res = service.cse().list(q=query, cx=CSE_ID, start=start).execute()
-        if "items" in res:
-            results.extend(res["items"])
-            start += 10
-        else:
-            break
-
+    async with aiohttp.ClientSession() as session:
+        while len(results) < num_results:
+            try:
+                async with session.get('https://www.googleapis.com/customsearch/v1', params={
+                    'key': API_KEY,
+                    'cx': CSE_ID,
+                    'q': query,
+                    'start': start
+                }) as response:
+                    res = await response.json()
+                    if "items" in res:
+                        results.extend(res["items"])
+                        start += 10
+                    else:
+                        break
+            except ClientConnectorError:
+                print(f"Connection error occurred during the request to the Google Search API for the query: {query}")
+                return []
+            except asyncio.TimeoutError:
+                print(f"Timeout occurred during the request to the Google Search API for the query: {query}")
+                return []
     return results[:num_results]
 
 
@@ -76,12 +96,13 @@ def clean_text(html):
     return soup.get_text()
 
 
-def get_cleaned_page(url):
+async def get_cleaned_page(session, url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"
     }
-    res = requests.get(url, headers=headers)
-    return clean_text(res.content)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as res:
+            return clean_text(await res.text())
 
 
 def truncate_text(text, max_tokens):
@@ -119,11 +140,19 @@ def query_chatgpt(text, first_name, last_name):
         {"role": "system", "content": f"You answer only with yes and no, without providing any explanations. You will answer questions about the following text \n {text}"},
         {"role": "user", "content": f"Answer to these questions about the text from the previous prompt:\n{questions}"}
     ]
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=messages,
-        temperature=0.5  # set the temperature.
-    )
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            temperature=0.5  # set the temperature.
+        )
+    except RateLimitError:
+        print("Rate limit exceeded on OpenAI API. Retrying after a delay...")
+        asyncio.sleep(5)  # Wait for 5 seconds before retrying
+        return query_chatgpt(text, first_name, last_name)  # Retry the request
+    except OpenAIError as e:
+        print(f"An error occurred while making a request to OpenAI: {e}")
+        return []  # Return an empty response in case of error
     print(response)
     return response.choices[0].message.content.strip().split("\n")
 
@@ -161,9 +190,7 @@ def calculate_score(weights):
     score = int(100 * q1 * q2_q4 / 3)
     return score
 
-
-@app.route("/search", methods=["GET"])
-def search_person():
+async def search_person(first_name, last_name, num_results, strict_search):
     global stop_search_flag
     # Reset the stop search flag at the beginning of a search
     set_stop_search(False)
@@ -174,58 +201,83 @@ def search_person():
     strict_search = request.args.get("strictSearch") == "true"
 
     if strict_search:
-        queries = [
-            f'"{first_name} {last_name}" "{term}"' for term in SEARCH_TERMS]
+        queries = [f'"{first_name} {last_name}" "{term}"' for term in SEARCH_TERMS]
     else:
         queries = [f'{first_name} {last_name} {term}' for term in SEARCH_TERMS]
 
     all_results = []
     total_results = 0  # Initialize the counter
 
-    for query in queries:
-        search_results = search(query, num_results)
-        for result in search_results:
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+
+        for query in queries:
+            search_results = search(query, num_results)
+            search_results = await search_results
+            for result in search_results:
+                # If the stop search flag is True, or the counter reached num_results, break the loop
+                if stop_search_flag or total_results >= num_results:
+                    break
+
+                url = result["link"]
+                title = result["title"]
+                snippet = result["snippet"]
+
+                try:
+                    # Create an aiohttp session
+                    async with aiohttp.ClientSession() as session:
+                        async with async_timeout.timeout(10):  # Set a timeout of 10 seconds
+                            cleaned_text = await get_cleaned_page(session, url)
+                except asyncio.TimeoutError:
+                    print(f"Timeout occurred while fetching the URL: {url}")
+                    continue  # Skip this URL and proceed to the next one
+
+                truncated_text = truncate_text(cleaned_text, 4096)
+
+                # Calculate tokens
+                total_tokens = calculate_total_tokens(
+                    truncated_text) + calculate_total_tokens(first_name + last_name) + EXTRA_TOKENS
+
+                # Truncate the text further if necessary
+                if total_tokens > MAX_TOKENS:
+                    extra_tokens = total_tokens - MAX_TOKENS
+                    truncated_text = truncate_text(truncated_text, extra_tokens)
+
+                future_chatgpt_response = loop.run_in_executor(executor, query_chatgpt, truncated_text, first_name, last_name)
+                chatgpt_response = await future_chatgpt_response
+                weights, summary = parse_chatgpt_response(chatgpt_response)
+                score = calculate_score(weights)
+                keywords = ", ".join(
+                    [term for i, term in enumerate(SEARCH_TERMS) if weights[i + 1] > 0])
+
+                socketio.emit('new_result', {
+                    "title": title,
+                    "score": score,
+                    "url": url,
+                    "snippet": snippet,
+                    "summary": summary,
+                    "keywords": keywords,
+                    "status": "TRUE" if score > 0 else "FALSE"
+                })
+
+                total_results += 1  # Update the counter
+
             # If the stop search flag is True, or the counter reached num_results, break the loop
             if stop_search_flag or total_results >= num_results:
                 break
 
-            url = result["link"]
-            title = result["title"]
-            snippet = result["snippet"]
-            cleaned_text = get_cleaned_page(url)
-            truncated_text = truncate_text(cleaned_text, 4096)
+    return '', 204
 
-            # Calculate tokens
-            total_tokens = calculate_total_tokens(
-                truncated_text) + calculate_total_tokens(first_name + last_name) + EXTRA_TOKENS
 
-            # Truncate the text further if necessary
-            if total_tokens > MAX_TOKENS:
-                extra_tokens = total_tokens - MAX_TOKENS
-                truncated_text = truncate_text(truncated_text, extra_tokens)
 
-            chatgpt_response = query_chatgpt(
-                truncated_text, first_name, last_name)
-            weights, summary = parse_chatgpt_response(chatgpt_response)
-            score = calculate_score(weights)
-            keywords = ", ".join(
-                [term for i, term in enumerate(SEARCH_TERMS) if weights[i + 1] > 0])
+@app.route("/search", methods=["GET"])
+async def search_route():
+    first_name = request.args.get("firstName")
+    last_name = request.args.get("lastName")
+    num_results = int(request.args.get("numResults"))
+    strict_search = request.args.get("strictSearch") == "true"
 
-            socketio.emit('new_result', {
-                "title": title,
-                "score": score,
-                "url": url,
-                "snippet": snippet,
-                "summary": summary,
-                "keywords": keywords,
-                "status": "TRUE" if score > 0 else "FALSE"
-            })
-
-            total_results += 1  # Update the counter
-
-        # If the stop search flag is True, or the counter reached num_results, break the loop
-        if stop_search_flag or total_results >= num_results:
-            break
+    await search_person(first_name, last_name, num_results, strict_search)
 
     return '', 204
 
@@ -234,7 +286,6 @@ def search_person():
 def index():
     return render_template('index.html')
 
-
 @app.route('/stop')
 def stop_search():
     set_stop_search(True)
@@ -242,4 +293,4 @@ def stop_search():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    socketio.run(app, debug=True)
