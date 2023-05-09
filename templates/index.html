@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Test Page</title>
+  <style>
+    /* Your CSS styles go here */
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f2f2f2;
+    }
+    .bs-popover-bottom {
+      width: 400px !important;
+    }
+    .popover {
+      max-width: 500px;
+    }
+    #resultsTable th:nth-child(6),
+    #resultsTable td:nth-child(6) {
+    width: 30%;
+    }
+    #resultsTable th:nth-child(4),
+    #resultsTable td:nth-child(4) {
+    width: 10% !important;
+    }
+  </style>
+  <!-- Bootstrap CSS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/5.1.1/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.2.1/css/fontawesome.min.css" />
+</head>
+<body class="bg-light">
+  <div class="container my-4">
+    <div class="row">
+      <div class="col-md-3">
+        <label class="form-label" for="firstName">First Name:</label>
+        <input type="text" class="form-control" id="firstName" value="">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label" for="lastName">Last Name:</label>
+        <input type="text" class="form-control" id="lastName" value="">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label" for="numResults">Num Results:</label>
+        <input type="text" class="form-control" id="numResults" value="15">
+      </div>
+      <div class="col-md-3">
+        <div class="form-check mt-4">
+          <input type="checkbox" class="form-check-input" id="strictSearch">
+          <label class="form-check-label" for="strictSearch">Strict Search</label>
+        </div>
+      </div>
+    </div>
+    <div class="row mt-4">
+      <div class="col-md-6">
+        <button type="button" class="btn btn-primary" id="search">Search</button>
+        <button type="button" class="btn btn-secondary" id="stopSearch">Stop Search</button>
+      </div>
+      <div class="col-md-6 text-end">
+        <button type="button" class="btn btn-success" id="saveJson">Save JSON</button>
+      </div>
+    </div>
+  </div>
+  <div class="container-fluid">
+    <table id="resultsTable" class="table table-bordered table-striped table-hover mt-4">
+      <thead>
+        <tr>
+          <th>Index</th>
+          <th>Title</th>
+          <th>Score <i class="fa-solid fa-question" data-toggle="popover" data-placement="top" title="Explanation of the Score column" data-content="" id="score-popover"></i></th>
+          <th>URL</th>
+          <th>Snippet</th>
+          <th>Summary</th>
+          <th>Keywords</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+
+  <!-- jQuery and Socket.io scripts -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.4.1/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.14.7/umd/popper.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/4.6.0/js/bootstrap.min.js"></script>
+
+
+<script>
+let rowIndex = 0;
+
+var explanation = "The application calculates a score for each search result using the ChatGPT response. It assigns weights to the answers based on specific keywords, such as 'yes', 'explicitly', and 'indirectly'. The score is computed using the formula 100 * Q1 * (Q2 + Q3 + Q4) / 3, where Q1-Q4 are the weights of the first four questions. This score helps determine the relevance of the result to the search query..\n\n";
+                   
+var scorePopover = document.getElementById("score-popover");
+scorePopover.setAttribute("data-content", explanation);
+
+function addResultToTable(result) {
+    const tableBody = $("#resultsTable tbody");
+
+    const row = $("<tr></tr>");
+    row.append($("<td></td>").text(++rowIndex));
+    row.append($("<td></td>").text(result.title));
+    row.append($("<td></td>").text(parseInt(result.score)));
+    row.append($("<td></td>").text(result.url));
+    row.append($("<td></td>").text(result.snippet));
+    row.append($("<td></td>").text(result.summary));
+    row.append($("<td></td>").text(result.keywords));
+    row.append($("<td></td>").text(result.status));
+    tableBody.append(row);
+}
+
+// Connect to the WebSocket server
+var socket = io.connect('http://' + document.domain + ':' + location.port);
+
+// Handle the 'new_result' event
+socket.on('new_result', function(result) {
+    addResultToTable(result);
+});
+
+function saveJson(results) {
+        const json = JSON.stringify(results, null, 2);
+        const blob = new Blob([json], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = new Date().toISOString().replace(/[:.]/g, "") + ".json";
+        a.click();
+    }
+
+$("#search").click(() => {
+    rowIndex = 0; // reset the index
+    const firstName = $("#firstName").val();
+    const lastName = $("#lastName").val();
+    const numResults = parseInt($("#numResults").val(), 10);
+    const strictSearch = $("#strictSearch").is(":checked");
+
+    $("#resultsTable tbody").empty();
+
+    $.get("/search", { firstName: firstName, lastName: lastName, numResults: numResults, strictSearch: strictSearch }, function(data) {
+        console.log("Search initiated");
+    });
+});
+
+$("#stopSearch").click(() => {
+    $.get("/stop", function(data) {
+        console.log("Search stopped");
+    });
+});
+
+$("#saveJson").click(() => {
+    const tableBody = $("#resultsTable tbody");
+    const results = [];
+    tableBody.find("tr").each(function() {
+        const row = $(this);
+        const result = {
+            index: row.find("td:nth-child(1)").text(),
+            title: row.find("td:nth-child(2)").text(),
+            score: parseInt(row.find("td:nth-child(3)").text(), 10),
+            url: row.find("td:nth-child(4)").text(),
+            snippet: row.find("td:nth-child(5)").text(),
+            summary: row.find("td:nth-child(6)").text(),
+            keywords: row.find("td:nth-child(7)").text(),
+            status: row.find("td:nth-child(8)").text()
+        };
+        results.push(result);
+    });
+    saveJson(results);
+});
+
+$(function () {
+  $('[data-toggle="popover"]').popover();
+});
+
+</script>
+</body>
+</html>
+
