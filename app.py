@@ -33,9 +33,9 @@ search_status = {}
 
 stop_search_flag = False
 
-API_KEY = "AIzaSyC2WO6N2kL2sR8RlRULKTGjpZbywTb-Ow8"
-CSE_ID = "805eea5ee29654a3f"
-OPENAI_API_KEY = "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"
+API_KEY = ""
+CSE_ID = ""
+OPENAI_API_KEY = ""
 SEARCH_TERMS = ["fraud", "crime", "money laundering"]
 EXTRA_TOKENS = 50
 MAX_TOKENS = 4097
